@@ -1,100 +1,110 @@
+import os, json, random
+import numpy as np
+import nibabel as nib
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
+from torchvision import transforms
+
+def zscore(x):
+    x = x.astype(np.float32)
+    m = np.mean(x)
+    s = np.std(x) + 1e-8
+    return (x - m) / s
+
+def resize_2d(x, out_hw=(224, 224)):
+    t = torch.from_numpy(x).float()[None, None, ...]
+    t = F.interpolate(t, size=out_hw, mode='bilinear', align_corners=False)
+    return t[0, 0].numpy()
 
 class ADNI2p5DTrainSlices(Dataset):
-    """
-    Dataset class for training 2.5D slice-based models on ADNI MRI data.
-
-    Each sample represents a group of 2D slices from a 3D MRI volume.
-    The 2.5D approach uses adjacent slices to provide limited 3D context 
-    without full 3D convolution.
-
-    Args:
-        root (str): Root directory containing subject data.
-        json_name (str): JSON file listing subject metadata (paths, labels, etc.).
-        subject_ids (list): List of subject IDs used for training.
-        use_key (str): Key to select image variant (e.g., 'masked', 'seg', 'original').
-        num_groups (int): Number of slice groups to sample per volume.
-        seed (int): Random seed for reproducibility.
-        augment (bool): Whether to apply data augmentation.
-    """
     def __init__(self, root, json_name, subject_ids, use_key='masked', num_groups=8, seed=42, augment=True):
-        # Initialize dataset parameters and load metadata
         self.root = root
-        self.json_name = json_name
-        self.subject_ids = subject_ids
         self.use_key = use_key
-        self.num_groups = num_groups
-        self.seed = seed
+        self.num_groups = max(1, int(num_groups))
         self.augment = augment
-        # Typically: load the JSON metadata and prepare slice index mappings here
-        # Example: self.samples = self._load_json_and_make_index(json_name, subject_ids)
+        self.rng = random.Random(seed)
+
+        with open(os.path.join(root, json_name), 'r') as f:
+            meta = json.load(f)
+        self.label_map = {0: 1, 2: 0}
+        self.records = []
+        for sid in subject_ids:
+            e = meta[sid]
+            if int(e['label']) not in (0, 2):
+                continue
+            self.records.append({
+                'sid': sid,
+                'path': os.path.join(root, e[self.use_key]),
+                'label': self.label_map[int(e['label'])]
+            })
+
+        self.tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0]),
+        ])
 
     def __len__(self):
-        """Return the total number of slice groups available for training."""
-        # Usually equal to len(self.samples)
-        pass
+        return len(self.records) * self.num_groups
 
     def _aug(self, s):
-        """
-        Apply random data augmentations to a slice or slice group.
-
-        Args:
-            s (Tensor): A slice tensor to augment.
-        Returns:
-            Tensor: Augmented slice tensor.
-        """
-        # Example: random flip, rotation, intensity jitter
-        pass
+        if not self.augment:
+            return s
+        if self.rng.random() < 0.5:
+            s = np.flip(s, axis=1).copy()
+        s = s + np.random.normal(0, 0.01, s.shape).astype(np.float32)
+        return s
 
     def __getitem__(self, idx):
-        """
-        Load one training sample (a group of 2D slices and its label).
-
-        Args:
-            idx (int): Index of the sample to fetch.
-        Returns:
-            (Tensor, int): Tuple of image tensor and corresponding label.
-        """
-        # Example steps:
-        # 1. Find slice paths from index
-        # 2. Load and stack adjacent slices (e.g., center ±1)
-        # 3. Apply augmentations if enabled
-        # 4. Return tensor and label
-        pass
-
+        rec = self.records[idx // self.num_groups]
+        vol = nib.load(rec['path']).get_fdata().astype(np.float32)
+        vol = zscore(vol)
+        H, W, D = vol.shape
+        z = self.rng.randint(1, D - 2)
+        s1, s2, s3 = vol[..., z - 1], vol[..., z], vol[..., z + 1]
+        s1, s2, s3 = self._aug(s1), self._aug(s2), self._aug(s3)
+        s1, s2, s3 = resize_2d(s1), resize_2d(s2), resize_2d(s3)
+        img = np.stack([s1, s2, s3], axis=-1)
+        x = self.tf(img)
+        y = torch.tensor(rec['label']).long()
+        return x, y, rec['sid']
 
 class ADNI2p5DEvalSubjects(Dataset):
-    """
-    Dataset class for evaluating or testing on full ADNI MRI subjects.
+    def __init__(self, root, json_name, subject_ids, use_key='masked', groups=12, seed=123):
+        self.root = root
+        self.use_key = use_key
+        self.groups = max(1, int(groups))
+        self.rng = random.Random(seed)
 
-    Each subject is loaded as a complete 3D volume divided into slice groups.
-    Used for subject-level inference and evaluation (no random augmentations).
-    """
+        with open(os.path.join(root, json_name), 'r') as f:
+            meta = json.load(f)
+        self.label_map = {0: 1, 2: 0}
+        self.items = []
+        for sid in subject_ids:
+            e = meta[sid]
+            if int(e['label']) not in (0, 2):
+                continue
+            self.items.append({
+                'sid': sid,
+                'path': os.path.join(root, e[self.use_key]),
+                'label': self.label_map[int(e['label'])]
+            })
+
+    def __len__(self):
+        return len(self.items)
 
     def _one_group(self, vol):
-        """
-        Given a 3D volume, extract one 2.5D group of slices.
-
-        Args:
-            vol (ndarray or Tensor): 3D MRI volume.
-        Returns:
-            Tensor: A stack of adjacent 2D slices (center slice + neighbors).
-        """
-        # Typically implemented by sliding window over z-axis
-        pass
+        H, W, D = vol.shape
+        z = self.rng.randint(1, D - 2)
+        s1, s2, s3 = vol[..., z - 1], vol[..., z], vol[..., z + 1]
+        s1, s2, s3 = resize_2d(zscore(s1)), resize_2d(zscore(s2)), resize_2d(zscore(s3))
+        img = np.stack([s1, s2, s3], axis=0)
+        return torch.from_numpy(img).float()
 
     def __getitem__(self, idx):
-        """
-        Load one subject for evaluation.
-
-        Args:
-            idx (int): Index of the subject.
-        Returns:
-            (Tensor, str): Tuple of the subject’s 2.5D slice tensor and subject ID.
-        """
-        # Steps:
-        # 1. Load full 3D MRI volume
-        # 2. Slice into 2.5D groups using _one_group()
-        # 3. Return all groups and subject identifier
-        pass
+        rec = self.items[idx]
+        vol = nib.load(rec['path']).get_fdata().astype(np.float32)
+        xs = [self._one_group(vol) for _ in range(self.groups)]
+        x = torch.stack(xs, dim=0)
+        y = torch.tensor(rec['label']).long()
+        return x, y, rec['sid']
