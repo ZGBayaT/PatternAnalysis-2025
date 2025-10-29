@@ -1,279 +1,288 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train.py — Image classification training script using user-provided dataset.py and modules.py.
+
+- Uses dataset helpers from dataset.py (expects get_train(...) and get_test(...)).
+- Uses model builders from modules.py (expects build_convnext(..., variant="tiny") or ConvNeXt tiny).
+- Supports CUDA AMP; on MPS/CPU AMP is disabled automatically.
+- Saves: last.pt, best.pt, history.csv, metrics.png under --outdir.
+"""
+
 import argparse
-import math
-import os
+import csv
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Tuple, Optional
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
+from torch import nn
+from torch.utils.data import DataLoader
 
-# Local modules
-import dataset as ds
-import modules as mdl
+# Import user modules
+import dataset as user_dataset
+import modules as user_modules
 
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Train ConvNeXt on custom dataset")
-    # Data / loader
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--workers", type=int, default=4)
-    # Optim
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--lr", type=float, default=5e-4)
-    p.add_argument("--weight-decay", type=float, default=0.05)
-    p.add_argument("--momentum", type=float, default=0.9, help="(only used if --optim sgd)")
-    p.add_argument("--optim", choices=["adamw", "sgd"], default="adamw")
-    p.add_argument("--clip-grad-norm", type=float, default=1.0)
-    # Model
-    p.add_argument("--model", choices=["tiny", "small"], default="tiny")
-    # Training
-    p.add_argument("--amp", action="store_true", help="enable mixed precision")
-    p.add_argument("--label-smoothing", type=float, default=0.0)
-    p.add_argument("--seed", type=int, default=42)
-    # Scheduler
-    p.add_argument("--sched", choices=["cosine", "step", "none"], default="cosine")
-    p.add_argument("--warmup-epochs", type=int, default=3)
-    p.add_argument("--step-size", type=int, default=10, help="for StepLR")
-    p.add_argument("--gamma", type=float, default=0.1, help="for StepLR")
-    # Checkpoints / logging
-    p.add_argument("--out", type=str, default="/Users/zadehbayat/Documents/Comp3710/demo3_git/outputs/exp1")
-    p.add_argument("--resume", type=str, default="", help="path to checkpoint(.pt) to resume from")
-    p.add_argument("--eval-only", action="store_true")
-    return p.parse_args()
-
-
-def set_seed(seed):
-    import random
-    import numpy as np
+# ----------------------------
+# Utils
+# ----------------------------
+def seed_everything(seed: int = 42):
+    import random, numpy as np
+    torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+#    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+#       return torch.device("mps")
+    return torch.device("cpu")
+
+def count_params(model: nn.Module) -> float:
+    return sum(p.numel() for p in model.parameters()) / 1e6
+
+@dataclass
+class TrainState:
+    epoch: int = 0
+    best_acc: float = 0.0
+    best_path: Optional[Path] = None
+
+# ----------------------------
+# Core train/eval loops
+# ----------------------------
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+) -> Tuple[float, float]:
+    model.train()
+    running_loss = 0.0
+    running_correct = 0
+    n = 0
+
+    for images, targets in loader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs = model(images)
+                loss = criterion(outputs, targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+        preds = outputs.argmax(dim=1)
+        running_correct += (preds == targets).sum().item()
+        n += images.size(0)
+
+    return running_loss / max(1, n), running_correct / max(1, n)
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, criterion=None):
+def evaluate(
+    model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device
+) -> Tuple[float, float]:
     model.eval()
-    correct = 0
-    total = 0
-    loss_sum = 0.0
-    for images, labels in loader:
+    running_loss = 0.0
+    running_correct = 0
+    n = 0
+
+    for images, targets in loader:
         images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
         outputs = model(images)
-        if criterion is not None:
-            loss = criterion(outputs, labels)
-            loss_sum += loss.item() * images.size(0)
-        _, preds = outputs.max(1)
-        correct += preds.eq(labels).sum().item()
-        total += images.size(0)
-    acc = correct / max(1, total)
-    avg_loss = (loss_sum / max(1, total)) if criterion is not None else float("nan")
-    return {"acc": acc, "loss": avg_loss}
+        loss = criterion(outputs, targets)
 
+        running_loss += loss.item() * images.size(0)
+        preds = outputs.argmax(dim=1)
+        running_correct += (preds == targets).sum().item()
+        n += images.size(0)
 
-def build_model(num_classes, which="tiny"):
-    if which == "tiny" and hasattr(mdl, "convnext_tiny"):
-        return mdl.convnext_tiny(num_classes)
-    if which == "small" and hasattr(mdl, "convnext_small"):
-        return mdl.convnext_small(num_classes)
-    # Fallback to ConvNeXt if helpers are absent
-    if hasattr(mdl, "ConvNeXt"):
-        return mdl.ConvNeXt(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], num_classes=num_classes)
-    raise RuntimeError("Could not construct model from modules.py")
+    return running_loss / max(1, n), running_correct / max(1, n)
 
+# ----------------------------
+# Build model via modules.py
+# ----------------------------
+def build_model(num_classes: int, variant: str = "tiny") -> nn.Module:
+    """
+    Tries common entrypoints in modules.py in order:
+    1) user_modules.build_convnext(variant=..., num_classes=...)
+    2) user_modules.ConvNeXt(...)
+    3) user_modules.convnext_tiny(...)
+    """
+    # Option 1: build_convnext
+    if hasattr(user_modules, "build_convnext"):
+        try:
+            return user_modules.build_convnext(variant=variant, num_classes=num_classes)
+        except TypeError:
+            # some versions don't accept keyword names
+            return user_modules.build_convnext(variant, num_classes)
+        except Exception:
+            pass
 
-def build_optimizer(name, params, lr, weight_decay, momentum):
-    if name == "adamw":
-        return optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-    if name == "sgd":
-        return optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
-    raise ValueError(name)
+    # Option 2: direct class + variants table
+    if hasattr(user_modules, "ConvNeXt"):
+        # guess variant dims/depths if provided
+        if hasattr(user_modules, "_VARIANTS") and variant in getattr(user_modules, "_VARIANTS"):
+            depths, dims = user_modules._VARIANTS[variant]
+            return user_modules.ConvNeXt(depths=depths, dims=dims, num_classes=num_classes)
 
+    # Option 3: a tiny helper function
+    for name in ("convnext_tiny", "tiny", "build_tiny"):
+        if hasattr(user_modules, name):
+            return getattr(user_modules, name)(num_classes=num_classes)
 
-def build_scheduler(name, optimizer, epochs, warmup_epochs, steps_per_epoch, step_size, gamma):
-    if name == "none":
-        return None, lambda e, i: 1.0
+    raise RuntimeError("Could not build model from modules.py. Expected build_convnext(...) or convnext_tiny(...).")
 
-    if name == "step":
-        sched = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
-        # no warmup
-        return sched, lambda e, i: optimizer.param_groups[0]["lr"]
-
-    # cosine with linear warmup
-    total_steps = epochs * steps_per_epoch
-    warmup_steps = max(0, warmup_epochs) * steps_per_epoch
-
-    def lr_lambda(current_step):
-        if current_step < warmup_steps and warmup_steps > 0:
-            return float(current_step) / float(max(1, warmup_steps))
-        progress = (current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    sched = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    return sched, lambda e, i: optimizer.param_groups[0]["lr"]
-
-
-def save_checkpoint(state, path):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(state, path)
-
-
+# ----------------------------
+# Main
+# ----------------------------
 def main():
-    args = parse_args()
-    set_seed(args.seed)
+    parser = argparse.ArgumentParser(description="Train ConvNeXt (tiny) on AD/NC dataset using dataset.py & modules.py")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch", type=int, default=32)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--variant", type=str, default="tiny", choices=["tiny", "small", "base", "large", "tiny_in"])
+    parser.add_argument("--outdir", type=str, default="runs/exp")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
+    seed_everything(args.seed)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    device = get_device()
+    print(f"=> Device: {device.type}")
+
+    # ----------------------------
+    # Dataloaders from dataset.py
+    # ----------------------------
+    # Expect dataset.py to already split AD/NC into train/test
+    if hasattr(user_dataset, "get_classes"):
+        classes = user_dataset.get_classes()
+        num_classes = len(classes)
     else:
-        device = torch.device("cpu")
+        # Fallback: assume binary AD/NC
+        classes = ["AD", "NC"]
+        num_classes = 2
+    print(f"=> Classes: {classes} (num_classes={num_classes})")
 
-    print(f"Using device: {device}")
-    torch.backends.cudnn.benchmark = device.type == "cuda"
-
-    # Dataloaders
-    train_loader = ds.get_train(batch_size=args.batch_size, workers=args.workers)
-    test_loader = ds.get_test(batch_size=args.batch_size, workers=args.workers)
-
-    # Infer classes
-    if hasattr(train_loader.dataset, "classes"):
-        num_classes = len(train_loader.dataset.classes)
-        class_names = list(train_loader.dataset.classes)
+    if hasattr(user_dataset, "get_train"):
+        train_loader = user_dataset.get_train(batch_size=args.batch, workers=args.workers)
     else:
-        # fallback – try to probe from batch
-        x, y = next(iter(train_loader))
-        num_classes = int(y.max().item()) + 1
-        class_names = [str(i) for i in range(num_classes)]
+        raise RuntimeError("dataset.py must provide get_train(batch_size, workers).")
 
-    model = build_model(num_classes, which=args.model).to(device)
-
-    # Loss
-    if args.label_smoothing > 0:
-        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    if hasattr(user_dataset, "get_test"):
+        val_loader = user_dataset.get_test(batch_size=args.batch, workers=args.workers)
     else:
-        criterion = nn.CrossEntropyLoss()
+        raise RuntimeError("dataset.py must provide get_test(batch_size, workers).")
 
-    # Optimizer & scheduler
-    optimizer = build_optimizer(args.optim, model.parameters(), args.lr, args.weight_decay, args.momentum)
-    steps_per_epoch = max(1, len(train_loader))
-    scheduler, _ = build_scheduler(
-        args.sched, optimizer, args.epochs, args.warmup_epochs, steps_per_epoch, args.step_size, args.gamma
-    )
+    # ----------------------------
+    # Model / Optim / Loss
+    # ----------------------------
+    model = build_model(num_classes=num_classes, variant=args.variant)
+    model.to(device)
+    print(f"=> Model params: {count_params(model):.2f} M")
 
-    # AMP
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Cosine schedule (no warmup for simplicity)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    start_epoch = 0
-    best_acc = 0.0
+    # AMP scaler only for CUDA
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
-    if args.resume and Path(args.resume).is_file():
-        ckpt = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(ckpt.get("model", ckpt))
-        if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        if "scaler" in ckpt and args.amp and ckpt["scaler"] is not None:
-            scaler.load_state_dict(ckpt["scaler"])
-        start_epoch = ckpt.get("epoch", 0)
-        best_acc = ckpt.get("best_acc", 0.0)
+    state = TrainState()
+    history_path = outdir / "history.csv"
+    with open(history_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "lr", "seconds"])
 
-    if args.eval_only:
-        metrics = evaluate(model, test_loader, device, criterion)
-        print(f"[Eval] acc={metrics['acc']:.4f} loss={metrics['loss']:.4f}")
-        return
+    # ----------------------------
+    # Train Loop
+    # ----------------------------
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+        scheduler.step()
+        lr_now = optimizer.param_groups[0]["lr"]
 
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+        elapsed = time.time() - t0
+        print(f"Epoch {epoch}/{args.epochs} | train_loss={train_loss:.4f} acc={train_acc:.3f} | "
+              f"val_loss={val_loss:.4f} acc={val_acc:.3f} | lr={lr_now:.2e} | {elapsed:.1f}s")
 
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-        epoch_loss = 0.0
-        epoch_correct = 0
-        epoch_total = 0
-        time_start = time.time()
+        # append history
+        with open(history_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch, f"{train_loss:.6f}", f"{train_acc:.6f}", f"{val_loss:.6f}", f"{val_acc:.6f}", f"{lr_now:.6e}", f"{elapsed:.2f}"])
 
-        for images, labels in train_loader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+        # Save last
+        torch.save({"epoch": epoch, "model": model.state_dict()}, outdir / "last.pt")
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=args.amp):
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+        # Save best
+        if val_acc > state.best_acc:
+            state.best_acc = val_acc
+            state.best_path = outdir / "best.pt"
+            torch.save({"epoch": epoch, "model": model.state_dict()}, state.best_path)
 
-            scaler.scale(loss).backward()
-            if args.clip_grad_norm is not None and args.clip_grad_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
+    # ----------------------------
+    # Final test on test set (reuse val_loader as test_loader provided by dataset.get_test)
+    # ----------------------------
+    test_loss, test_acc = evaluate(model, val_loader, criterion, device)
+    print(f"=> Test: loss={test_loss:.4f} acc={test_acc:.3f}")
 
-            if isinstance(scheduler, torch.optim.lr_scheduler.StepLR):
-                # step per-epoch later
-                pass
-            elif scheduler is not None:
-                scheduler.step()
+    # ----------------------------
+    # Plot metrics
+    # ----------------------------
+    try:
+        import pandas as pd
+        import matplotlib.pyplot as plt
 
-            epoch_loss += loss.item() * images.size(0)
-            _, preds = outputs.max(1)
-            epoch_correct += preds.eq(labels).sum().item()
-            epoch_total += images.size(0)
+        hist = pd.read_csv(history_path)
+        # Loss plot
+        plt.figure()
+        plt.plot(hist["epoch"], hist["train_loss"], label="train_loss")
+        plt.plot(hist["epoch"], hist["val_loss"], label="val_loss")
+        plt.xlabel("epoch")
+        plt.ylabel("loss")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(outdir / "metrics_loss.png", dpi=150)
+        plt.close()
 
-        # epoch end
-        if isinstance(scheduler, torch.optim.lr_scheduler.StepLR):
-            scheduler.step()
+        # Acc plot
+        plt.figure()
+        plt.plot(hist["epoch"], hist["train_acc"], label="train_acc")
+        plt.plot(hist["epoch"], hist["val_acc"], label="val_acc")
+        plt.xlabel("epoch")
+        plt.ylabel("accuracy")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(outdir / "metrics_acc.png", dpi=150)
+        plt.close()
+    except Exception as e:
+        print(f"Plotting failed: {e}")
 
-        train_loss = epoch_loss / max(1, epoch_total)
-        train_acc = epoch_correct / max(1, epoch_total)
-
-        # evaluate
-        metrics = evaluate(model, test_loader, device, criterion)
-        test_acc, test_loss = metrics["acc"], metrics["loss"]
-        dt = time.time() - time_start
-
-        print(
-            f"Epoch {epoch+1:03d}/{args.epochs} | "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
-            f"val_loss={test_loss:.4f} val_acc={test_acc:.4f} | "
-            f"time={dt:.1f}s"
-        )
-
-        # save "last"
-        save_checkpoint(
-            {
-                "epoch": epoch + 1,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scaler": scaler.state_dict() if args.amp else None,
-                "best_acc": best_acc,
-                "class_names": class_names,
-                "args": vars(args),
-            },
-            out_dir / "last.pt",
-        )
-
-        # save "best"
-        if test_acc > best_acc:
-            best_acc = test_acc
-            save_checkpoint(
-                {
-                    "epoch": epoch + 1,
-                    "model": model.state_dict(),
-                    "best_acc": best_acc,
-                    "class_names": class_names,
-                    "args": vars(args),
-                },
-                out_dir / "best.pt",
-            )
-
-    # final eval on best (if exists)
-    best_path = out_dir / "best.pt"
-    if best_path.exists():
-        ckpt = torch.load(best_path, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
-        final = evaluate(model.to(device), test_loader, device, criterion)
-        print(f"[Best] acc={final['acc']:.4f} loss={final['loss']:.4f}")
 
 
 if __name__ == "__main__":

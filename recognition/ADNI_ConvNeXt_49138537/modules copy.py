@@ -76,8 +76,9 @@ class ConvNeXtBlock(nn.Module):
             x = self.gamma * x
         # NHWC -> NCHW
         x = x.permute(0, 3, 1, 2).contiguous()
-        
-        x = shortcut + self.drop_path(x)
+        x=self.drop_path(x)
+        x=x.contiguous()
+        x = shortcut + x
         return x
 
 

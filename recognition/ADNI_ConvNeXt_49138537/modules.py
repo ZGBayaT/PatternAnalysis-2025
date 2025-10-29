@@ -16,7 +16,7 @@ class DropPath(nn.Module):
         shape = (x.shape[0],) + (1,) * (x.ndim - 1) #every img in batch own one random mask
         random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
         random_tensor.floor_()
-        output = x.div(keep_prob) * random_tensor
+        output = x.contiguous().div(keep_prob) * random_tensor
         return output
 
 #to fit both (B,C,H,W) and (B,H,W,C)
@@ -66,7 +66,7 @@ class Block(nn.Module):
         if self.gamma is not None:
             x = self.gamma * x #decrease weight to make training smoother increase accuracy
         x = x.permute(0, 3, 1, 2)  # [N, H, W, C] -> [N, C, H, W]
-
+        x = x.contiguous()
         x = shortcut + self.drop_path(x)
         return x
 
@@ -105,6 +105,7 @@ class ConvNeXt(nn.Module):
             self.stages.append(stage)
             cur += depths[i]
             
+            
         # final norm layer
         self.norm = nn.LayerNorm(dims[-1], eps=1e-6) 
         self.head = nn.Linear(dims[-1], num_classes)
@@ -122,7 +123,10 @@ class ConvNeXt(nn.Module):
             x = self.downsample_layers[i](x)
             x = self.stages[i](x)
         # global average pooling, (N, C, H, W) -> (N, C)
-        return self.norm(x.mean([-2, -1]))  #get one value for classify
+        x = x.mean([-2, -1])
+        x = x.contiguous()
+        x = self.norm(x)
+        return x  #get one value for classify
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.forward_features(x)
