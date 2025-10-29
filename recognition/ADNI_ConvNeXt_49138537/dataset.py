@@ -1,49 +1,71 @@
-from torchvision import datasets
+from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
-from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 from pathlib import Path
-from PIL import Image
+import torch
 
-# 数据目录
 ROOT = Path("/Users/zadehbayat/Documents/Comp3710/demo3_git/ADNI")
 TRAIN_DIR = ROOT / "AD_NC" / "train"
 TEST_DIR  = ROOT / "AD_NC" / "test"
-
-# 标准化
+class AddGaussianNoise:
+    def __init__(self, std=0.01):
+        self.std = std
+    def __call__(self, x):
+        return (x + self.std * torch.randn_like(x)).clamp(0.0, 1.0)
+    def __repr__(self):
+        return f"{self.__class__.__name__}(std={self.std})"
+    
 IMAGENET_NORM = transforms.Normalize(
     mean=[0.485, 0.456, 0.406],
     std=[0.229, 0.224, 0.225]
 )
 
-# 定义 transform（图像预处理流程）
-def data_processing():
-    data_tf = transforms.Compose([
+def train_transform():
+    return transforms.Compose([
         transforms.Grayscale(num_output_channels=3),
-        transforms.Resize((224, 224)),
+        transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC, antialias=True),
+        transforms.RandomAffine(
+            degrees=7,
+            translate=(0.04, 0.04),
+            scale=(0.95, 1.05),
+            interpolation=InterpolationMode.BICUBIC,
+            fill=0
+        ),
+        transforms.ColorJitter(brightness=0.08, contrast=0.08),
+        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.15),
+        transforms.ToTensor(),
+        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.15),
+
+        IMAGENET_NORM,
+    ])
+
+def test_transform():
+    return transforms.Compose([
+        transforms.Grayscale(num_output_channels=3),
+        transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC, antialias=True),
         transforms.ToTensor(),
         IMAGENET_NORM,
     ])
-    return data_tf
 
-
-# 创建 DataLoader
-def get_train():
-    train_dataset = datasets.ImageFolder(root=TRAIN_DIR, transform=data_processing())
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=32,
+def get_train(batch_size=32, workers=4):
+    ds = datasets.ImageFolder(root=TRAIN_DIR, transform=train_transform())
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=4
+        num_workers=workers,
+        pin_memory=True,
+        persistent_workers=(workers > 0),
     )
-    return train_loader
 
-def get_test():
-    test_dataset  = datasets.ImageFolder(root=TEST_DIR,  transform=data_processing())
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=64,
+def get_test(batch_size=64, workers=4):
+    ds = datasets.ImageFolder(root=TEST_DIR, transform=test_transform())
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=4
+        num_workers=workers,
+        pin_memory=True,
+        persistent_workers=(workers > 0),
     )
-    return test_loader
 
