@@ -39,10 +39,8 @@ class ADNI2p5DTrainSlices(Dataset):
                 'label': self.label_map[int(e['label'])]
             })
 
-        self.tf = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0]),
-        ])
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])
 
     def __len__(self):
         return len(self.records) * self.num_groups
