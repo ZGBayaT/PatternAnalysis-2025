@@ -107,7 +107,7 @@ class ConvNeXt(nn.Module):
             
         # final norm layer
         self.norm = nn.LayerNorm(dims[-1], eps=1e-6) 
-        self.head = nn.Linear([-1], num_classes)
+        self.head = nn.Linear(dims[-1], num_classes)
         self.apply(self._init_weights)
         self.head.weight.data.mul_(head_init_scale)
         self.head.bias.data.mul_(head_init_scale)
@@ -145,28 +145,3 @@ def convnext_small(num_classes: int):
                      num_classes=num_classes)
     return model
 
-
-def convnext_base(num_classes: int):
-    # https://dl.fbaipublicfiles.com/convnext/convnext_base_1k_224_ema.pth
-    # https://dl.fbaipublicfiles.com/convnext/convnext_base_22k_224.pth
-    model = ConvNeXt(depths=[3, 3, 27, 3],
-                     dims=[128, 256, 512, 1024],
-                     num_classes=num_classes)
-    return model
-
-
-def convnext_large(num_classes: int):
-    # https://dl.fbaipublicfiles.com/convnext/convnext_large_1k_224_ema.pth
-    # https://dl.fbaipublicfiles.com/convnext/convnext_large_22k_224.pth
-    model = ConvNeXt(depths=[3, 3, 27, 3],
-                     dims=[192, 384, 768, 1536],
-                     num_classes=num_classes)
-    return model
-
-
-def convnext_xlarge(num_classes: int):
-    # https://dl.fbaipublicfiles.com/convnext/convnext_xlarge_22k_224.pth
-    model = ConvNeXt(depths=[3, 3, 27, 3],
-                     dims=[256, 512, 1024, 2048],
-                     num_classes=num_classes)
-    return model
