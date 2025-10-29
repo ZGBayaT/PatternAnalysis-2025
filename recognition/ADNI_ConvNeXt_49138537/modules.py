@@ -1,4 +1,3 @@
-# modules.py
 from typing import List, Tuple
 import torch
 import torch.nn as nn
@@ -67,7 +66,7 @@ class ConvNeXtBlock(nn.Module):
         shortcut = x
         x = self.dwconv(x)  # (N,C,H,W)
         # NCHW -> NHWC
-        x = x.permute(0, 2, 3, 1)
+        x = x.permute(0, 2, 3, 1).contiguous()
         x = self.ln(x)
         x = self.pwconv1(x)
         x = self.act(x)
@@ -75,7 +74,7 @@ class ConvNeXtBlock(nn.Module):
         if self.gamma is not None:
             x = self.gamma * x
         # NHWC -> NCHW
-        x = x.permute(0, 3, 1, 2)
+        x = x.permute(0, 3, 1, 2).contiguous()
         x = shortcut + self.drop_path(x)
         return x
 
