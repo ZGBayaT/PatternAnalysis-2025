@@ -58,5 +58,8 @@ Example of a training curve:
 | **matplotlib** | 3.10.0 |
 | **scikit-learn** | 1.7.1 |
 
-**Reproducibility:**  
+### Pre-processing
+Convert each grayscale MRI slice to 3 channels to match ImageNet-style backbones, resize to 224×224, and normalise with ImageNet mean/std (0.485/0.456/0.406; 0.229/0.224/0.225).
+
+### Reproducibility:
 It is reproducible with correspond setting, dependcies and seed(default=42)
