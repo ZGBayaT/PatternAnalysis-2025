@@ -23,6 +23,7 @@ IMAGENET_NORM = transforms.Normalize(
 )
 
 def train_transform():
+    #make small change to training set increase ability of normalization
     return transforms.Compose([
         transforms.Grayscale(num_output_channels=3),
         transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC, antialias=True),
@@ -35,7 +36,7 @@ def train_transform():
         ),
         transforms.ColorJitter(brightness=0.05, contrast=0.05),
         transforms.ToTensor(),
-        # 只保留一次 Blur（可选）与一次轻噪声（可选）
+        #add gaussian noise decrsase overfit
         transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.10),
         transforms.RandomApply([AddGaussianNoise(std=0.01)], p=0.20),
         IMAGENET_NORM,
