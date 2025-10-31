@@ -1,6 +1,5 @@
 import torch
 from torchvision import transforms, datasets
-from pathlib import Path
 from modules import convnext_tiny, convnext_small
 # ===========================
 #  Config

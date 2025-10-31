@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-train.py — Image classification training script using user-provided dataset.py and modules.py.
-
-- Uses dataset helpers from dataset.py (expects get_train(...) and get_test(...)).
-- Uses model builders from modules.py (expects build_convnext(..., variant="tiny") or ConvNeXt tiny).
-- Supports CUDA AMP; on MPS/CPU AMP is disabled automatically.
-- Saves: last.pt, best.pt, history.csv, metrics.png under --outdir.
-"""
-
 import argparse
 import csv
 import time
